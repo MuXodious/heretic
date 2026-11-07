@@ -149,7 +149,7 @@ Heretic combines a pluggable modifier (interface in
 powered by [Optuna](https://optuna.org/). The optimizer finds a set of parameters that,
 when passed to the modifier, minimize or maximize a set of configurable scores on the resulting model ([see above](#controlling-what-heretic-does-using-scorer-plugins)).
 
-Heretic ships with two modifiers:
+Heretic ships with three modifiers:
 
 * **Arbitrary-Rank Ablation (ARA)**[^4]: This is the default modifier, and was
   specifically developed for use in Heretic. You can find an overview of how ARA
@@ -161,10 +161,21 @@ Heretic ships with two modifiers:
   the layers, and supports both projected abliteration[^6] and norm preservation (MPOA)[^7].
   The complete code is in [`abliteration.py`](/src/heretic/modifiers/abliteration.py).
 
+* **Self-Organising Multidirectional Abliteration (SOMA)**[^8]: An abliteration method
+  that uses multiple refusal directions per layer. The directions are
+  derived by training a Self-Organizing Map[^9] on the bad prompt residuals of each
+  layer and using the weights of its most representative neurons as the "bad"
+  centroids. It supports the same projected-abliteration and MPOA options as
+  abliteration. See the precise implementation in [`soma.py`](/src/heretic/modifiers/soma.py).
+
 [^4]: *Weidmann 2026.* A preprint explaining the technique will be available soon.
 [^5]: *[Arditi et al. 2024](https://arxiv.org/abs/2406.11717)*
 [^6]: *[Lai 2025 (1)](https://huggingface.co/blog/grimjim/projected-abliteration)*
 [^7]: *[Lai 2025 (2)](https://huggingface.co/blog/grimjim/norm-preserving-biprojected-abliteration)*
+[^8]: *[Piras et al. 2026, "SOM Directions are Better than One"](https://arxiv.org/abs/2511.08379)*;
+      original Heretic implementation by [kabachuha](https://github.com/p-e-w/heretic/pull/196).
+[^9]: Self-Organizing Maps are a class of unsupervised neural networks that map
+      high-dimensional data onto a low-dimensional grid while preserving its topology.
 
 You can use the `modifiers` setting to switch between modifier implementations.
 Despite the name of the setting using a plural form, Heretic currently allows

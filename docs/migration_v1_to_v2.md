@@ -53,6 +53,24 @@ This includes the following settings:
 > To configure ARA, edit the `[modifier.ARA]` section.
 
 
+## Move multidirectional SOM (SOMA) settings to the `[modifier.SOMA]` section
+
+If your 1.x configuration used the multidirectional Self-Organizing Map feature
+(`multidirectional_som = true`), use the SOMA modifier instead of the
+Abliteration modifier: set the `modifiers` setting to
+`{ plugin = "heretic.modifiers.soma.SOMA" }` and move the following settings
+from the top level to the `[modifier.SOMA]` section:
+
+* `orthogonalize_direction`
+* `row_normalization`
+* `full_normalization_lora_rank`
+* `winsorization_quantile`
+* `multidirectional_som`
+* `som_x`, `som_y`, `som_iterations`, `som_lr`, `som_sigma`, `som_k`
+* `[good_prompts]` (renamed to `[modifier.SOMA.good_prompts]`)
+* `[bad_prompts]` (renamed to `[modifier.SOMA.bad_prompts]`)
+
+
 ## Move refusal evaluation settings to the `[scorer.KeywordRate]` section
 
 This includes the following settings:
