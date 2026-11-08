@@ -15,13 +15,14 @@ from torch import Tensor, nn
 
 from heretic.config import Settings as HereticSettings
 from heretic.modifier import Modifier
-from heretic.modifiers.abliteration import RowNormalization
 from heretic.modifiers.soma import (
     SOMA,
     DirectionWeightDistribution,
     Parameters,
+    RowNormalization,
     Settings,
     SOMCalculator,
+    compute_refusal_directions,
     decompose_delta,
 )
 from heretic.plugin import Context, load_plugin
@@ -152,7 +153,7 @@ class DirectionComputationTests(unittest.TestCase):
         good_means = torch.randn(5, 8)  # (n_layers, hidden_dim)
         bad_means = torch.randn(2, 5, 8)  # (n_directions, n_layers, hidden_dim)
 
-        directions = SOMA.compute_refusal_directions(
+        directions = compute_refusal_directions(
             good_means,
             bad_means,
             orthogonalize_direction=False,
@@ -167,7 +168,7 @@ class DirectionComputationTests(unittest.TestCase):
         good_means = torch.randn(5, 8)
         bad_means = torch.randn(5, 8).unsqueeze(0)  # (1, n_layers, hidden_dim)
 
-        directions = SOMA.compute_refusal_directions(
+        directions = compute_refusal_directions(
             good_means,
             bad_means,
             orthogonalize_direction=True,
@@ -187,7 +188,7 @@ class DirectionComputationTests(unittest.TestCase):
         good_means = torch.randn(5, 8)
         bad_means = torch.randn(3, 5, 8)
 
-        directions = SOMA.compute_refusal_directions(
+        directions = compute_refusal_directions(
             good_means,
             bad_means,
             orthogonalize_direction=True,
@@ -254,46 +255,34 @@ class DecomposeDeltaTests(unittest.TestCase):
 
 
 class LoraRankTests(unittest.TestCase):
-    def test_default_full_normalization(self) -> None:
-        soma = make_soma()
-        self.assertEqual(soma.lora_rank, 3)
+    # SOMA is always multi-directional, so the som_k rank floor is always
+    # active unless the user sets an explicit full_normalization_lora_rank.
 
-    def test_floor_at_som_k_when_multidirectional(self) -> None:
-        soma = make_soma(multidirectional_som=True)
+    def test_default_full_normalization_floored(self) -> None:
         # Default full_normalization_lora_rank is 3, som_k is 4.
+        soma = make_soma()
         self.assertEqual(soma.lora_rank, 4)
 
-    def test_explicit_rank_wins_when_higher(self) -> None:
-        soma = make_soma(
-            multidirectional_som=True,
-            som_k=5,
-            full_normalization_lora_rank=32,
-        )
+    def test_floor_at_som_k(self) -> None:
+        soma = make_soma(som_k=5)
+        self.assertEqual(soma.lora_rank, 5)
+
+    def test_explicit_rank_wins(self) -> None:
+        # An explicitly set rank takes precedence over the som_k lower bound.
+        soma = make_soma(som_k=5, full_normalization_lora_rank=32)
         self.assertEqual(soma.lora_rank, 32)
 
-    def test_non_full_normalization(self) -> None:
+    def test_non_full_normalization_floored(self) -> None:
+        # Without renormalization the per-direction deltas are rank 1 each,
+        # but the adapter is still floored at som_k to store all directions.
         soma = make_soma(row_normalization=RowNormalization.NONE)
-        self.assertEqual(soma.lora_rank, 1)
-
-        soma = make_soma(
-            multidirectional_som=True,
-            row_normalization=RowNormalization.NONE,
-        )
         self.assertEqual(soma.lora_rank, 4)
 
     def test_explicit_rank_wins_over_som_k_floor(self) -> None:
         # An explicitly set rank takes precedence over the som_k lower bound,
         # even when it is below som_k.
-        soma = make_soma(
-            multidirectional_som=True,
-            som_k=5,
-            full_normalization_lora_rank=2,
-        )
+        soma = make_soma(som_k=5, full_normalization_lora_rank=2)
         self.assertEqual(soma.lora_rank, 2)
-
-        # The floor only applies to the built-in default (unset) rank.
-        soma = make_soma(multidirectional_som=True, som_k=5)
-        self.assertEqual(soma.lora_rank, 5)
 
 
 class ParametersTests(unittest.TestCase):
@@ -381,7 +370,7 @@ class PluginContractTests(unittest.TestCase):
         model_extra = {
             "modifier": {
                 "SOMA": {
-                    "multidirectional_som": True,
+                    "orthogonalize_direction": True,
                     "som_k": 8,
                     "unknown_key": "dropped",
                 },
@@ -393,7 +382,7 @@ class PluginContractTests(unittest.TestCase):
 
         raw = SOMA.get_settings_raw(model_extra, "modifier", None)
 
-        self.assertEqual(raw["multidirectional_som"], True)
+        self.assertEqual(raw["orthogonalize_direction"], True)
         self.assertEqual(raw["som_k"], 8)
         self.assertNotIn("unknown_key", raw)
         self.assertNotIn("lora_rank", raw)
@@ -420,43 +409,24 @@ class PluginContractTests(unittest.TestCase):
         cases = [
             (
                 {
-                    "multidirectional_som": True,
                     "orthogonalize_direction": True,
                     "row_normalization": "full",
                 },
-                "SOMA + MPOA",
+                "SOMPOA",
             ),
             (
                 {
-                    "multidirectional_som": True,
+                    "orthogonalize_direction": True,
+                    "row_normalization": "none",
+                },
+                "Projected SOMA",
+            ),
+            (
+                {
                     "orthogonalize_direction": False,
                     "row_normalization": "none",
                 },
                 "SOMA",
-            ),
-            (
-                {
-                    "multidirectional_som": False,
-                    "orthogonalize_direction": True,
-                    "row_normalization": "full",
-                },
-                "Magnitude-Preserving Orthogonal Ablation (MPOA)",
-            ),
-            (
-                {
-                    "multidirectional_som": False,
-                    "orthogonalize_direction": True,
-                    "row_normalization": "none",
-                },
-                "Projected Abliteration",
-            ),
-            (
-                {
-                    "multidirectional_som": False,
-                    "orthogonalize_direction": False,
-                    "row_normalization": "none",
-                },
-                "Abliteration",
             ),
         ]
 
@@ -638,7 +608,7 @@ class ModifyModuleTests(unittest.TestCase):
 
 class SuggestParametersTests(unittest.TestCase):
     def test_samples_per_direction_weights(self) -> None:
-        soma = make_soma(multidirectional_som=True, som_k=3)
+        soma = make_soma(som_k=3)
 
         # Stub the directions that init() would have computed.
         # (n_layers, n_directions, hidden_dim)

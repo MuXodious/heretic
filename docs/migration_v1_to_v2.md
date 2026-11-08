@@ -65,7 +65,6 @@ from the top level to the `[modifier.SOMA]` section:
 * `row_normalization`
 * `full_normalization_lora_rank`
 * `winsorization_quantile`
-* `multidirectional_som`
 * `som_x`, `som_y`, `som_iterations`, `som_lr`, `som_sigma`, `som_k`
 * `[good_prompts]` (renamed to `[modifier.SOMA.good_prompts]`)
 * `[bad_prompts]` (renamed to `[modifier.SOMA.bad_prompts]`)

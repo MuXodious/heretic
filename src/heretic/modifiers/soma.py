@@ -9,10 +9,15 @@
 # representative, de-duplicated) neurons as the "bad" centroids.
 #
 # Ported from https://github.com/p-e-w/heretic/pull/196 (kabachuha).
+#
+# Implements the method of Piras et al., "SOM Directions are Better than One:
+# Multi-Directional Refusal Suppression in Language Models" (AAAI 2026):
+# https://arxiv.org/abs/2511.08379
 
 import math
 from collections import defaultdict
 from dataclasses import asdict, dataclass
+from enum import Enum
 from typing import Any, cast
 
 import bitsandbytes.functional as BNB_F
@@ -32,7 +37,6 @@ from torch import Tensor
 
 from heretic.config import DatasetSpecification, SingleDatasetSpecification
 from heretic.modifier import Context, Modifier, Serializable
-from heretic.modifiers.abliteration import RowNormalization
 from heretic.system import empty_cache
 from heretic.utils import format_dataset_specification, print
 
@@ -209,6 +213,13 @@ class Parameters(Serializable):
         )
 
 
+class RowNormalization(str, Enum):
+    NONE = "none"
+    PRE = "pre"
+    # POST = "post"  # Theoretically possible, but provides no advantage.
+    FULL = "full"
+
+
 class Settings(BaseModel):
     good_prompts: DatasetSpecification = Field(
         default=SingleDatasetSpecification(
@@ -228,18 +239,46 @@ class Settings(BaseModel):
         description="Dataset of prompts that tend to produce undesirable responses.",
     )
 
-    multidirectional_som: bool = Field(
-        default=False,
+    orthogonalize_direction: bool = Field(
+        default=True,
         description=(
-            "Whether to derive multiple refusal directions per layer using a "
-            "Self-Organizing Map (SOM) trained on the bad prompt residuals. "
-            "When disabled, a single direction per layer is used (classic abliteration). "
-            "See Piras et al. 2026 (arXiv:2511.08379) for the method, "
-            "and https://github.com/p-e-w/heretic/pull/196 for the original "
-            "Heretic implementation by kabachuha."
+            "Whether to adjust the residual directions so that only the component that is "
+            "orthogonal to the good direction is subtracted during abliteration."
         ),
     )
 
+    row_normalization: RowNormalization = Field(
+        default=RowNormalization.FULL,
+        description=(
+            "How to apply row normalization of the weights. Options: "
+            '"none" (no normalization), '
+            '"pre" (compute LoRA adapter relative to row-normalized weights), '
+            '"full" (like "pre", but renormalizes to preserve original row magnitudes).'
+        ),
+    )
+
+    full_normalization_lora_rank: PositiveInt = Field(
+        default=4,
+        description=(
+            'The rank of the LoRA adapter to use when "full" row normalization is used. '
+            "Row magnitude preservation is approximate due to non-linear effects, "
+            "and this determines the rank of that approximation. Higher ranks produce "
+            "larger output files and may slow down evaluation."
+        ),
+    )
+
+    winsorization_quantile: float = Field(
+        default=1.0,
+        description=(
+            "The symmetric winsorization to apply to the per-prompt, per-layer residual vectors, "
+            "expressed as the quantile to clamp to (between 0 and 1). Disabled by default. "
+            'This can tame so-called "massive activations" that occur in some models. '
+            "Example: winsorization_quantile = 0.95 computes the 0.95-quantile of the absolute values "
+            "of the components, then clamps the magnitudes of all components to that quantile."
+        ),
+    )
+
+    # Multi-directional SOM settings
     som_x: PositiveInt = Field(
         default=4,
         description="Number of SOM neurons in the x-axis.",
@@ -270,49 +309,65 @@ class Settings(BaseModel):
         description=(
             "Number of top (most representative) SOM neurons to use as "
             "refusal directions. Also serves as a lower bound for the "
-            "LoRA adapter rank when multidirectional_som is enabled "
+            "LoRA adapter rank, since the summed multi-direction delta "
+            "has rank at most som_k "
             "(unless full_normalization_lora_rank is explicitly set)."
         ),
     )
 
-    orthogonalize_direction: bool = Field(
-        default=True,
-        description=(
-            "Whether to adjust the residual directions so that only the component that is "
-            "orthogonal to the good direction is subtracted during abliteration."
-        ),
-    )
 
-    row_normalization: RowNormalization = Field(
-        default=RowNormalization.FULL,
-        description=(
-            "How to apply row normalization of the weights. Options: "
-            '"none" (no normalization), '
-            '"pre" (compute LoRA adapter relative to row-normalized weights), '
-            '"full" (like "pre", but renormalizes to preserve original row magnitudes).'
-        ),
-    )
+def compute_refusal_directions(
+    good_means: Tensor,
+    bad_means: Tensor,
+    orthogonalize_direction: bool,
+) -> Tensor:
+    """
+    Computes the refusal directions for each "bad" mean.
 
-    full_normalization_lora_rank: PositiveInt = Field(
-        default=3,
-        description=(
-            'The rank of the LoRA adapter to use when "full" row normalization is used. '
-            "Row magnitude preservation is approximate due to non-linear effects, "
-            "and this determines the rank of that approximation. Higher ranks produce "
-            "larger output files and may slow down evaluation."
-        ),
-    )
+    Args:
+        good_means (Tensor): The "good" residual mean with shape
+            (n_layers, hidden_dim).
+        bad_means (Tensor): The "bad" residual means with shape
+            (n_directions, n_layers, hidden_dim).
+        orthogonalize_direction (bool): Whether to adjust the directions
+            so that only the component orthogonal to the good direction
+            is subtracted during abliteration.
 
-    winsorization_quantile: float = Field(
-        default=1.0,
-        description=(
-            "The symmetric winsorization to apply to the per-prompt, per-layer residual vectors, "
-            "expressed as the quantile to clamp to (between 0 and 1). Disabled by default. "
-            'This can tame so-called "massive activations" that occur in some models. '
-            "Example: winsorization_quantile = 0.95 computes the 0.95-quantile of the absolute values "
-            "of the components, then clamps the magnitudes of all components to that quantile."
-        ),
-    )
+    Returns:
+        Tensor: The refusal directions with shape
+        (n_layers, n_directions, hidden_dim).
+    """
+    refusal_directions = [
+        F.normalize(bad_mean - good_means, p=2, dim=1) for bad_mean in bad_means
+    ]
+
+    if orthogonalize_direction:
+        # Implements https://huggingface.co/blog/grimjim/projected-abliteration
+        # Adjust the refusal directions so that only the component that is
+        # orthogonal to the good direction is subtracted during abliteration.
+        good_directions = F.normalize(
+            good_means,
+            p=2,
+            dim=1,
+        )
+        projection_vectors = [
+            torch.sum(refusal_direction * good_directions, dim=1)
+            for refusal_direction in refusal_directions
+        ]
+        refusal_directions = [
+            refusal_direction - projection_vector.unsqueeze(1) * good_directions
+            for (
+                refusal_direction,
+                projection_vector,
+            ) in zip(refusal_directions, projection_vectors)
+        ]
+        refusal_directions = [
+            F.normalize(refusal_direction, p=2, dim=1)
+            for refusal_direction in refusal_directions
+        ]
+
+    # (n_directions, n_layers, hidden_dim) -> (n_layers, n_directions, hidden_dim)
+    return torch.stack(refusal_directions, dim=0).permute(1, 0, 2)
 
 
 # Decomposes a delta matrix into LoRA factors (lora_B, lora_A) via a
@@ -360,35 +415,27 @@ class SOMA(Modifier[Parameters]):
 
     @property
     def modifier_name(self) -> str:
-        if self.settings.multidirectional_som:
-            if (
-                self.settings.orthogonalize_direction
-                and self.settings.row_normalization == RowNormalization.FULL
-            ):
-                return "SOMPOA"
-            return "SOMA"
-        elif (
+        if (
             self.settings.orthogonalize_direction
             and self.settings.row_normalization == RowNormalization.FULL
         ):
-            return "Magnitude-Preserving Orthogonal Ablation (MPOA)"
+            return "SOMPOA"
         elif self.settings.orthogonalize_direction:
-            return "Projected Abliteration"
+            return "Projected SOMA"
         else:
-            return "Abliteration"
+            return "SOMA"
 
     @property
     def lora_rank(self) -> int:
         """
         The rank of the LoRA adapter to use.
 
-        Without multidirectional SOM, rank 1 is sufficient to store the
-        single-direction delta exactly (row normalization "full" is an
-        approximation of rank `full_normalization_lora_rank`). With
-        multidirectional SOM, the delta is the sum of k rank-1 direction
-        deltas and has rank at most k, so truncating the adapter below
-        k would drop entire directions: the rank is bounded below by
-        `som_k`.
+        The multi-direction delta is the sum of som_k rank-1 direction
+        deltas and has rank at most som_k, so truncating the adapter
+        below som_k would drop entire directions: the rank is bounded
+        below by `som_k` (row normalization "full" otherwise approximates
+        rank `full_normalization_lora_rank`, and without renormalization
+        the per-direction deltas are rank 1 each).
 
         An explicitly set `full_normalization_lora_rank` takes precedence
         over the `som_k` bound, which only applies to the built-in default.
@@ -396,16 +443,13 @@ class SOMA(Modifier[Parameters]):
         if self.settings.row_normalization == RowNormalization.FULL:
             rank = self.settings.full_normalization_lora_rank
         else:
-            # Rank 1 is sufficient for directional ablation without renormalization.
+            # Rank 1 is sufficient per direction without renormalization;
+            # the som_k floor below accounts for the number of directions.
             rank = 1
 
-        if self.settings.multidirectional_som:
-            # The user's explicit choice takes precedence over the som_k bound.
-            explicit_rank = (
-                "full_normalization_lora_rank" in self.settings.model_fields_set
-            )
-            if not explicit_rank:
-                rank = max(rank, self.settings.som_k)
+        # The user's explicit choice takes precedence over the som_k bound.
+        if "full_normalization_lora_rank" not in self.settings.model_fields_set:
+            rank = max(rank, self.settings.som_k)
 
         return rank
 
@@ -435,28 +479,21 @@ class SOMA(Modifier[Parameters]):
             winsorization_quantile=self.settings.winsorization_quantile,
         )
 
-        if self.settings.multidirectional_som:
-            # The SOM is trained on the distribution of per-prompt residuals,
-            # not just their mean, so obtain the raw residuals.
-            print("* Obtaining residuals for bad prompts...")
-            bad_residuals = model.get_residuals_batched(
-                bad_prompts,
-                winsorization_quantile=self.settings.winsorization_quantile,
-            )
-            bad_means = self.obtain_som_means(bad_residuals)
-            # We don't need the residuals after obtaining the SOM means.
-            del bad_residuals
-            empty_cache()
-        else:
-            print("* Obtaining residual mean for bad prompts...")
-            bad_means = model.get_residuals_mean(
-                bad_prompts,
-                winsorization_quantile=self.settings.winsorization_quantile,
-            ).unsqueeze(0)
+        # The SOM is trained on the distribution of per-prompt residuals,
+        # not just their mean, so obtain the raw residuals.
+        print("* Obtaining residual mean for bad prompts...")
+        bad_residuals = model.get_residuals_batched(
+            bad_prompts,
+            winsorization_quantile=self.settings.winsorization_quantile,
+        )
+        bad_means = self.obtain_som_means(bad_residuals)
+        # We don't need the residuals after obtaining the SOM means.
+        del bad_residuals
+        empty_cache()
 
         # bad_means has shape (n_directions, n_layers, hidden_dim),
-        # where n_directions is 1 without multidirectional SOM.
-        self.residual_directions = self.compute_refusal_directions(
+        # where n_directions is som_k.
+        self.residual_directions = compute_refusal_directions(
             good_means,
             bad_means,
             orthogonalize_direction=self.settings.orthogonalize_direction,
@@ -465,62 +502,6 @@ class SOMA(Modifier[Parameters]):
         # LoRA B matrices are initialized to zero by default in PEFT,
         # so we don't need to do anything manually.
         model.apply_lora(self.lora_rank)
-
-    # Computes the per-layer refusal directions from the "good" and "bad"
-    # residual means.
-    @staticmethod
-    def compute_refusal_directions(
-        good_means: Tensor,
-        bad_means: Tensor,
-        orthogonalize_direction: bool,
-    ) -> Tensor:
-        """
-        Computes the refusal directions for each "bad" mean.
-
-        Args:
-            good_means (Tensor): The "good" residual mean with shape
-                (n_layers, hidden_dim).
-            bad_means (Tensor): The "bad" residual means with shape
-                (n_directions, n_layers, hidden_dim).
-            orthogonalize_direction (bool): Whether to adjust the directions
-                so that only the component orthogonal to the good direction
-                is subtracted during abliteration.
-
-        Returns:
-            Tensor: The refusal directions with shape
-            (n_layers, n_directions, hidden_dim).
-        """
-        refusal_directions = [
-            F.normalize(bad_mean - good_means, p=2, dim=1) for bad_mean in bad_means
-        ]
-
-        if orthogonalize_direction:
-            # Implements https://huggingface.co/blog/grimjim/projected-abliteration
-            # Adjust the refusal directions so that only the component that is
-            # orthogonal to the good direction is subtracted during abliteration.
-            good_directions = F.normalize(
-                good_means,
-                p=2,
-                dim=1,
-            )
-            projection_vectors = [
-                torch.sum(refusal_direction * good_directions, dim=1)
-                for refusal_direction in refusal_directions
-            ]
-            refusal_directions = [
-                refusal_direction - projection_vector.unsqueeze(1) * good_directions
-                for (
-                    refusal_direction,
-                    projection_vector,
-                ) in zip(refusal_directions, projection_vectors)
-            ]
-            refusal_directions = [
-                F.normalize(refusal_direction, p=2, dim=1)
-                for refusal_direction in refusal_directions
-            ]
-
-        # (n_directions, n_layers, hidden_dim) -> (n_layers, n_directions, hidden_dim)
-        return torch.stack(refusal_directions, dim=0).permute(1, 0, 2)
 
     # Trains a SOM on the bad residuals of each layer and returns the weights
     # of the most representative neurons as the per-layer "bad" centroids.
@@ -714,6 +695,8 @@ class SOMA(Modifier[Parameters]):
             # Shape: (n_layers, n_directions, hidden_dim)
             layer_refusal_directions = refusal_directions
 
+        # Note that some implementations of abliteration also orthogonalize
+        # the embedding matrix, but it's unclear if that has any benefits.
         for layer_index in range(len(model.get_layers())):
             for component, modules in model.get_layer_modules(layer_index).items():
                 params = parameters.weight_distributions[component]
@@ -740,6 +723,8 @@ class SOMA(Modifier[Parameters]):
                 layer_base_weight = params.max_weights[0] + (
                     distance / params.min_weight_distance
                 ) * (params.min_weights[0] - params.max_weights[0])
+                # Note: in the single-direction logic this was the final weight;
+                # here it is a base factor that is further scaled per direction.
 
                 # A weight of 0 disables this component's ablation. reset_model() has
                 # already left the adapter at identity, so abort before the otherwise
