@@ -53,6 +53,7 @@ class SOMCalculator:
         iterations: int,
         lr: float,
         sigma: float,
+        seed: int | None = None,
     ) -> None:
         """
         Initializes the SOM calculator with training parameters.
@@ -70,6 +71,7 @@ class SOMCalculator:
         self.lr = lr
         self.sigma = sigma
         self.som: MiniSom | None = None
+        self.seed = seed
 
     def fit(self, data: np.ndarray) -> None:
         """
@@ -91,7 +93,7 @@ class SOMCalculator:
             n_features,
             sigma=self.sigma,
             learning_rate=self.lr,
-            random_seed=self.heretic_settings.seed,  # For reproducibility
+            random_seed=self.seed,  # For reproducibility
             activation_distance="euclidean",
             topology="hexagonal",
         )
@@ -532,6 +534,7 @@ class SOMA(Modifier[Parameters]):
                 iterations=self.settings.som_iterations,
                 lr=self.settings.som_lr,
                 sigma=self.settings.som_sigma,
+                seed=self.heretic_settings.seed,
             )
             som_calc.fit(layer_residuals)
 
