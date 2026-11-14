@@ -259,7 +259,7 @@ class LoraRankTests(unittest.TestCase):
     # active unless the user sets an explicit full_normalization_lora_rank.
 
     def test_default_full_normalization_floored(self) -> None:
-        # Default full_normalization_lora_rank is 3, som_k is 4.
+        # Default full_normalization_lora_rank is 4, som_k is 4.
         soma = make_soma()
         self.assertEqual(soma.lora_rank, 4)
 
@@ -283,6 +283,14 @@ class LoraRankTests(unittest.TestCase):
         # even when it is below som_k.
         soma = make_soma(som_k=5, full_normalization_lora_rank=2)
         self.assertEqual(soma.lora_rank, 2)
+
+    def test_non_full_ignores_explicit_full_rank(self) -> None:
+        # full_normalization_lora_rank only applies to FULL; without it, the
+        # rank is always som_k even if full_normalization_lora_rank is set.
+        soma = make_soma(
+            row_normalization=RowNormalization.NONE, full_normalization_lora_rank=32
+        )
+        self.assertEqual(soma.lora_rank, 4)
 
 
 class ParametersTests(unittest.TestCase):
@@ -321,14 +329,15 @@ class ParametersTests(unittest.TestCase):
         self.assertEqual(next(iter(presentation)), "direction_index")
         self.assertEqual(presentation["direction_index"], "20.83")
 
-        # Per-direction values are rendered as "index: value".
-        self.assertEqual(presentation["attn.o_proj.max_weights.0"], "0: 1.28")
-        self.assertEqual(presentation["attn.o_proj.max_weights.1"], "1: 1.32")
-        self.assertEqual(presentation["attn.o_proj.max_weights.2"], "2: 1.14")
+        # Per-direction values are rendered as the value only (the index is
+        # already carried by the key).
+        self.assertEqual(presentation["attn.o_proj.max_weights.0"], "1.28")
+        self.assertEqual(presentation["attn.o_proj.max_weights.1"], "1.32")
+        self.assertEqual(presentation["attn.o_proj.max_weights.2"], "1.14")
         self.assertEqual(presentation["attn.o_proj.max_weight_position"], "23.56")
-        self.assertEqual(presentation["attn.o_proj.min_weights.0"], "0: 0.69")
+        self.assertEqual(presentation["attn.o_proj.min_weights.0"], "0.69")
         self.assertEqual(presentation["attn.o_proj.min_weight_distance"], "12.40")
-        self.assertEqual(presentation["mlp.down_proj.max_weights.1"], "1: 0.53")
+        self.assertEqual(presentation["mlp.down_proj.max_weights.1"], "0.53")
 
     def test_presentation_dict_per_layer(self) -> None:
         parameters = Parameters(

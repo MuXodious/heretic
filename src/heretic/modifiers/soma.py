@@ -4,8 +4,8 @@
 # Self-Organising Multidirectional Abliteration (SOMA).
 #
 # Extends directional abliteration with multiple refusal directions per layer,
-# derived by training a Self-Organizing Map (SOM) on the bad prompt residuals 
-# of each layer and using the weights of the most frequently winning (i.e. most 
+# derived by training a Self-Organizing Map (SOM) on the bad prompt residuals
+# of each layer and using the weights of the most frequently winning (i.e. most
 # representative, de-duplicated) neurons as the "bad" centroids.
 #
 # Ported from https://github.com/p-e-w/heretic/pull/196 (kabachuha).
@@ -91,7 +91,7 @@ class SOMCalculator:
             n_features,
             sigma=self.sigma,
             learning_rate=self.lr,
-            random_seed=0,  # For reproducibility
+            random_seed=self.heretic_settings.seed,  # For reproducibility
             activation_distance="euclidean",
             topology="hexagonal",
         )
@@ -184,16 +184,12 @@ class Parameters(Serializable):
 
         for component, weight_distribution in self.weight_distributions.items():
             for direction, value in enumerate(weight_distribution.max_weights):
-                parameters[f"{component}.max_weights.{direction}"] = (
-                    f"{direction}: {value:.2f}"
-                )
+                parameters[f"{component}.max_weights.{direction}"] = f"{value:.2f}"
             parameters[f"{component}.max_weight_position"] = (
                 f"{weight_distribution.max_weight_position:.2f}"
             )
             for direction, value in enumerate(weight_distribution.min_weights):
-                parameters[f"{component}.min_weights.{direction}"] = (
-                    f"{direction}: {value:.2f}"
-                )
+                parameters[f"{component}.min_weights.{direction}"] = f"{value:.2f}"
             parameters[f"{component}.min_weight_distance"] = (
                 f"{weight_distribution.min_weight_distance:.2f}"
             )
@@ -442,16 +438,13 @@ class SOMA(Modifier[Parameters]):
         """
         if self.settings.row_normalization == RowNormalization.FULL:
             rank = self.settings.full_normalization_lora_rank
-        else:
-            # Rank 1 is sufficient per direction without renormalization;
-            # the som_k floor below accounts for the number of directions.
-            rank = 1
-
-        # The user's explicit choice takes precedence over the som_k bound.
-        if "full_normalization_lora_rank" not in self.settings.model_fields_set:
-            rank = max(rank, self.settings.som_k)
-
-        return rank
+            # The user's explicit choice takes precedence over the som_k bound.
+            if "full_normalization_lora_rank" not in self.settings.model_fields_set:
+                rank = max(rank, self.settings.som_k)
+            return rank
+        # Rank 1 is sufficient per direction without renormalization;
+        # the som_k floor accounts for the number of directions.
+        return self.settings.som_k
 
     def init(self, ctx: Context) -> None:
         model = ctx.get_model()
@@ -550,7 +543,6 @@ class SOMA(Modifier[Parameters]):
             t = torch.tensor(
                 top_k_weights,
                 dtype=bad_residuals.dtype,
-                device=bad_residuals.device,
             )
             num_found_neurons = t.shape[0]
 
@@ -676,19 +668,13 @@ class SOMA(Modifier[Parameters]):
             idx1 = int(index)
             idx2 = min(idx1 + 1, refusal_directions.shape[0] - 1)
             # Shape: (n_directions, hidden_dim)
-            layer_refusal_directions = torch.stack(
-                [
-                    F.normalize(
-                        direction[idx1].lerp(
-                            direction[idx2],
-                            weight,
-                        ),
-                        p=2,
-                        dim=0,
-                    )
-                    for direction in refusal_directions.permute(1, 0, 2)
-                ],
-                dim=0,
+            layer_refusal_directions = F.normalize(
+                refusal_directions[idx1].lerp(
+                    refusal_directions[idx2],
+                    weight,
+                ),
+                p=2,
+                dim=1,
             )
         else:
             # Per layer: each layer uses its own set of directions.
